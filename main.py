@@ -11,6 +11,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from openai import OpenAI
 
@@ -53,7 +54,7 @@ chat_limiter = RateLimiter(default_limit=60)
 
 def verify_admin_token(authorization: str | None = Header(None)):
     if not ADMIN_API_TOKEN:
-        return
+        raise HTTPException(status_code=503, detail="Admin API not configured")
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid token")
     token = authorization.removeprefix("Bearer ")
@@ -190,39 +191,43 @@ def telegram_polling():
                     chat_id = msg["chat"]["id"]
                     text = msg["text"].strip()
 
-                    if text in ("/start", "/help"):
+                    if not TELEGRAM_ADMIN_ID or str(chat_id) == str(TELEGRAM_ADMIN_ID):
+                        admin = True
+                    else:
+                        admin = False
                         requests.post(
                             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                            json={
-                                "chat_id": chat_id,
-                                "text": (
-                                    "*Aivex Bot*\n\n"
-                                    "Доступные команды:\n"
-                                    "/users - список всех пользователей\n"
-                                    "/devices - список всех устройств\n"
-                                    "/sub <user_id> - подписка пользователя\n"
-                                    "/settier <user_id> <tier> - изменить тариф\n"
-                                    "/help - эта справка"
-                                ),
-                                "parse_mode": "Markdown",
-                            },
+                            json={"chat_id": chat_id, "text": "⛔ У вас нет прав."},
                         )
                         continue
 
-                    if TELEGRAM_ADMIN_ID and str(chat_id) != str(TELEGRAM_ADMIN_ID):
+                    def send(text, **kw):
                         requests.post(
                             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                            json={"chat_id": chat_id, "text": "⛔ У вас нет прав на эту команду."},
+                            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown", **kw},
+                        )
+
+                    def menu_keyboard():
+                        return {
+                            "inline_keyboard": [
+                                [{"text": "👥 Пользователи", "callback_data": "menu_users"},
+                                 {"text": "💻 Устройства", "callback_data": "menu_devices"}],
+                                [{"text": "❓ Помощь", "callback_data": "menu_help"}],
+                            ]
+                        }
+
+                    if text in ("/start", "/help", "/menu"):
+                        send(
+                            "*Aivex Bot*\n\n"
+                            "Управляй подписками и устройствами 👇",
+                            reply_markup=menu_keyboard(),
                         )
                         continue
 
                     try:
                         conn = get_db()
                     except Exception as e:
-                        requests.post(
-                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                            json={"chat_id": chat_id, "text": f"Ошибка БД: {e}"},
-                        )
+                        send(f"Ошибка БД: {e}")
                         continue
 
                     if text == "/users":
@@ -230,6 +235,7 @@ def telegram_polling():
                         cur.execute(
                             """SELECT u.*,
                                       (SELECT COUNT(*) FROM devices d WHERE d.user_id = u.id AND d.approved) AS devices_count,
+                                      (SELECT d.username FROM devices d WHERE d.user_id = u.id ORDER BY d.created_at DESC LIMIT 1) AS device_username,
                                       s.tier
                                FROM users u
                                LEFT JOIN subscriptions s ON s.user_id = u.id
@@ -240,24 +246,26 @@ def telegram_polling():
                         conn.close()
 
                         if not rows:
-                            reply = "Нет пользователей."
+                            send("Нет пользователей.")
                         else:
-                            lines = ["*Все пользователи:*\n"]
-                            for r in rows:
+                            lines = []
+                            for i, r in enumerate(rows, 1):
                                 email = r["email"] or "-"
+                                username = r["device_username"] or "-"
                                 tier = r["tier"] or "free"
                                 devices = r["devices_count"] or 0
-                                tag = f"({r['telegram_id']})" if r["telegram_id"] else ""
                                 lines.append(
-                                    f"#{r['id']} {tag} {email}\n"
-                                    f"  Устройств: {devices} | Тариф: {tier}"
+                                    f"{i}. #{r['id']} | {username}\n"
+                                    f"   📱 {devices} | 💳 {tier}"
                                 )
-                            reply = "\n\n".join(lines)
-
-                        requests.post(
-                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                            json={"chat_id": chat_id, "text": reply, "parse_mode": "Markdown"},
-                        )
+                            send(
+                                f"*👥 Пользователи*\n\n" + "\n\n".join(lines),
+                                reply_markup={
+                                    "inline_keyboard": [
+                                        [{"text": "🔙 Назад", "callback_data": "menu_back"}],
+                                    ]
+                                },
+                            )
 
                     elif text == "/devices":
                         cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -274,145 +282,386 @@ def telegram_polling():
                         conn.close()
 
                         if not rows:
-                            reply = "Нет устройств."
+                            send("Нет устройств.")
                         else:
-                            lines = ["*Все устройства:*\n"]
+                            lines = []
                             for r in rows:
-                                status = "OK" if r["approved"] else ("NO" if r["denied"] else "..")
+                                status = "✅" if r["approved"] else ("❌" if r["denied"] else "⏳")
                                 user = r["email"] or "-"
                                 pid = r["device_id"][:8] if r["device_id"] else "???"
-                                lines.append(
-                                    f"{status} {pid}..\n"
-                                    f"  Пользователь: {user} | {r['platform'] or '-'} | {r['app_version'] or '-'}"
+                                lines.append(f"{status} `{pid}...` | {user} | {r['platform'] or '-'}")
+                            send(
+                                f"*💻 Устройства*\n\n" + "\n".join(lines),
+                                reply_markup={
+                                    "inline_keyboard": [
+                                        [{"text": "🔙 Назад", "callback_data": "menu_back"}],
+                                    ]
+                                },
+                            )
+
+                    elif text.startswith("/sub") and len(text.split()) == 2:
+                        try:
+                            uid = int(text.split()[1])
+                            cur = conn.cursor(cursor_factory=RealDictCursor)
+                            cur.execute("SELECT * FROM subscriptions WHERE user_id = %s", (uid,))
+                            sub = cur.fetchone()
+                            cur.close()
+                            conn.close()
+                            if sub:
+                                tier = sub["tier"]
+                                active = "✅" if sub["is_active"] else "❌"
+                                started = sub["started_at"].isoformat()[:10] if sub["started_at"] else "-"
+                                expires = sub["expires_at"].isoformat()[:10] if sub["expires_at"] else "бессрочно"
+                                send(
+                                    f"*👤 Пользователь #{uid}*\n\n"
+                                    f"💳 Тариф: `{tier}`\n"
+                                    f"✅ Активна: {active}\n"
+                                    f"📅 С: {started}\n"
+                                    f"⏳ До: {expires}",
+                                    reply_markup={
+                                        "inline_keyboard": [
+                                            [{"text": "✏️ Изменить тариф", "callback_data": f"settier_{uid}"}],
+                                            [{"text": "🔙 Назад", "callback_data": "menu_back"}],
+                                        ]
+                                    },
                                 )
-                            reply = "\n\n".join(lines)
-
-                        requests.post(
-                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                            json={"chat_id": chat_id, "text": reply, "parse_mode": "Markdown"},
-                        )
-
-                    elif text.startswith("/settier"):
-                        parts = text.split()
-                        if len(parts) != 3:
-                            reply = "Использование: `/settier <user_id> <tier>`\nТарифы: free, pro, premium"
-                        else:
-                            _, uid, tier = parts
-                            if tier not in ("free", "pro", "premium"):
-                                reply = "Неверный тариф. Допустимо: free, pro, premium"
                             else:
-                                try:
-                                    cur = conn.cursor()
-                                    cur.execute(
-                                        """INSERT INTO subscriptions (user_id, tier)
-                                           VALUES (%s, %s)
-                                           ON CONFLICT (user_id) DO UPDATE SET tier = EXCLUDED.tier, is_active = TRUE""",
-                                        (int(uid), tier),
-                                    )
-                                    conn.commit()
-                                    cur.close()
-                                    conn.close()
-                                    reply = f"Тариф пользователя #{uid} изменён на *{tier}*"
-                                except Exception as e:
-                                    cur.close()
-                                    conn.close()
-                                    reply = f"Ошибка: {e}"
+                                send(
+                                    f"*👤 Пользователь #{uid}*\n\n💳 Тариф: `free`\nУ пользователя нет подписки.",
+                                    reply_markup={
+                                        "inline_keyboard": [
+                                            [{"text": "✏️ Назначить тариф", "callback_data": f"settier_{uid}"}],
+                                            [{"text": "🔙 Назад", "callback_data": "menu_back"}],
+                                        ]
+                                    },
+                                )
+                        except Exception as e:
+                            send(f"Ошибка: {e}")
 
-                        requests.post(
-                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                            json={"chat_id": chat_id, "text": reply, "parse_mode": "Markdown"},
-                        )
-
-                    elif text.startswith("/subscription") or text.startswith("/sub"):
-                        parts = text.split()
-                        if len(parts) < 2:
-                            reply = "Использование: `/subscription <user_id>`"
-                        else:
-                            try:
-                                uid = int(parts[1])
-                                cur = conn.cursor(cursor_factory=RealDictCursor)
-                                cur.execute("SELECT * FROM subscriptions WHERE user_id = %s", (uid,))
-                                sub = cur.fetchone()
-                                cur.close()
-                                conn.close()
-                                if sub:
-                                    tier = sub["tier"]
-                                    active = "Да" if sub["is_active"] else "Нет"
-                                    started = sub["started_at"].isoformat() if sub["started_at"] else "-"
-                                    reply = f"Пользователь #{uid}\nТариф: {tier}\nАктивна: {active}\nС: {started}"
-                                else:
-                                    reply = f"У пользователя #{uid} нет подписки (тариф free)"
-                            except Exception as e:
-                                reply = f"Ошибка: {e}"
-
-                        requests.post(
-                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                            json={"chat_id": chat_id, "text": reply, "parse_mode": "Markdown"},
-                        )
                     continue
 
-                # ── handle callback queries (approve / deny) ──
+                # ── handle callback queries ──
                 callback = update.get("callback_query")
                 if not callback:
                     continue
 
-                try:
-                    conn = get_db()
-                except Exception as e:
-                    print(f"Telegram polling: get_db failed: {e}")
-                    continue
+                chat_id = callback["message"]["chat"]["id"]
+                cid = callback["id"]
+                data = callback["data"]
 
-                action, request_id = callback["data"].split(":", 1)
-                cur = conn.cursor(cursor_factory=RealDictCursor)
+                def answer(text):
+                    requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                        json={"callback_query_id": cid, "text": text},
+                    )
 
-                cur.execute(
-                    "SELECT * FROM devices WHERE request_id = %s", (request_id,)
-                )
-                device = cur.fetchone()
+                def edit(text, **kw):
+                    requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
+                        json={
+                            "chat_id": chat_id,
+                            "message_id": callback["message"]["message_id"],
+                            "text": text,
+                            "parse_mode": "Markdown",
+                            **kw,
+                        },
+                    )
 
-                if not device:
-                    cur.close()
-                    conn.close()
-                    continue
+                def menu_keyboard():
+                    return {
+                        "inline_keyboard": [
+                            [{"text": "👥 Пользователи", "callback_data": "menu_users"},
+                             {"text": "💻 Устройства", "callback_data": "menu_devices"}],
+                            [{"text": "❓ Помощь", "callback_data": "menu_help"}],
+                        ]
+                    }
 
-                if action == "approve":
-                    cur.execute(
-                        "UPDATE devices SET approved = TRUE, denied = FALSE, approved_at = NOW() WHERE request_id = %s",
-                        (request_id,),
+                # ── menu navigation ──
+                if data == "menu_back":
+                    edit("*Aivex Bot*\n\nУправляй подписками и устройствами 👇", reply_markup=menu_keyboard())
+                    answer("Меню")
+
+                elif data == "menu_help":
+                    edit(
+                        "*Aivex Bot*\n\n"
+                        "`/users` — список пользователей\n"
+                        "`/devices` — список устройств\n"
+                        "`/sub <id>` — информация о подписке\n"
+                        "`/settier <id> <tier> [срок]` — назначить тариф\n\n"
+                        "Пример: `/settier 5 premium \"30 days\"`\n"
+                        "Срок: `\"1 hour\"`, `\"7 days\"`, `\"90 days\"`",
+                        reply_markup={"inline_keyboard": [[{"text": "🔙 Назад", "callback_data": "menu_back"}]]},
                     )
-                    cur.execute(
-                        """INSERT INTO users (telegram_id) VALUES (%s)
-                           ON CONFLICT (telegram_id) DO UPDATE SET updated_at = NOW()""",
-                        (TELEGRAM_ADMIN_ID,),
+                    answer("Помощь")
+
+                elif data == "menu_users":
+                    try:
+                        conn = get_db()
+                        cur = conn.cursor(cursor_factory=RealDictCursor)
+                        cur.execute(
+                            """SELECT u.*,
+                                      (SELECT COUNT(*) FROM devices d WHERE d.user_id = u.id AND d.approved) AS devices_count,
+                                      (SELECT d.username FROM devices d WHERE d.user_id = u.id ORDER BY d.created_at DESC LIMIT 1) AS device_username,
+                                      s.tier
+                               FROM users u
+                               LEFT JOIN subscriptions s ON s.user_id = u.id
+                               ORDER BY u.created_at DESC"""
+                        )
+                        rows = cur.fetchall()
+                        cur.close()
+                        conn.close()
+                    except Exception as e:
+                        edit(f"Ошибка БД: {e}")
+                        answer("Ошибка")
+                        continue
+
+                    if not rows:
+                        edit("Нет пользователей.", reply_markup={"inline_keyboard": [[{"text": "🔙 Назад", "callback_data": "menu_back"}]]})
+                    else:
+                        kb = []
+                        for i, r in enumerate(rows[:10], 1):
+                            tier = r["tier"] or "free"
+                            username = r["device_username"] or "-"
+                            kb.append([{"text": f"{i}. #{r['id']} | {username} | {tier}", "callback_data": f"sub_{r['id']}"}])
+                        kb.append([{"text": "🔙 Назад", "callback_data": "menu_back"}])
+                        edit("*👥 Пользователи*\n\nНажми на пользователя чтобы управлять 👇", reply_markup={"inline_keyboard": kb})
+                    answer(f"{len(rows)} пользователей")
+
+                elif data == "menu_devices":
+                    try:
+                        conn = get_db()
+                        cur = conn.cursor(cursor_factory=RealDictCursor)
+                        cur.execute(
+                            """SELECT d.id, d.device_id, d.platform, d.app_version,
+                                      d.username, d.approved, d.denied, d.created_at,
+                                      u.email
+                               FROM devices d
+                               LEFT JOIN users u ON u.id = d.user_id
+                               ORDER BY d.created_at DESC"""
+                        )
+                        rows = cur.fetchall()
+                        cur.close()
+                        conn.close()
+                    except Exception as e:
+                        edit(f"Ошибка БД: {e}")
+                        answer("Ошибка")
+                        continue
+
+                    if not rows:
+                        edit("Нет устройств.", reply_markup={"inline_keyboard": [[{"text": "🔙 Назад", "callback_data": "menu_back"}]]})
+                    else:
+                        kb = []
+                        for r in rows[:15]:
+                            status = "✅" if r["approved"] else ("❌" if r["denied"] else "⏳")
+                            pid = r["device_id"][:8] if r["device_id"] else "???"
+                            uname = r["username"] or "-"
+                            label = f"{status} {pid}... | {uname}"
+                            kb.append([{"text": label, "callback_data": f"device_{r['device_id']}"}])
+                        kb.append([{"text": "🔙 Назад", "callback_data": "menu_back"}])
+                        edit("*💻 Устройства*\n\nНажми на устройство чтобы управлять 👇", reply_markup={"inline_keyboard": kb})
+                    answer(f"{len(rows)} устройств")
+
+                elif data.startswith("device_"):
+                    device_id = data[len("device_"):]
+                    try:
+                        conn = get_db()
+                        cur = conn.cursor(cursor_factory=RealDictCursor)
+                        cur.execute("SELECT * FROM devices WHERE device_id = %s", (device_id,))
+                        dev = cur.fetchone()
+                        cur.close()
+                        conn.close()
+                    except Exception as e:
+                        edit(f"Ошибка: {e}")
+                        answer("Ошибка")
+                        continue
+
+                    if not dev:
+                        edit("Устройство не найдено", reply_markup={"inline_keyboard": [[{"text": "🔙 Назад", "callback_data": "menu_devices"}]]})
+                        answer("Нет")
+                        continue
+
+                    status = "✅ Одобрено" if dev["approved"] else ("❌ Заблокировано" if dev["denied"] else "⏳ Ожидает")
+                    pid = dev["device_id"][:12] if dev["device_id"] else "???"
+                    uname = dev["username"] or "-"
+                    plat = dev["platform"] or "-"
+                    ver = dev["app_version"] or "-"
+
+                    toggle_btn = []
+                    if dev["approved"] or dev["denied"]:
+                        toggle_btn.append({"text": "🔓 Вернуть доступ", "callback_data": f"toggle_{device_id}"})
+                    if dev["approved"]:
+                        toggle_btn.append({"text": "🔒 Заблокировать", "callback_data": f"block_{device_id}"})
+                    if dev["denied"]:
+                        toggle_btn.append({"text": "✅ Одобрить", "callback_data": f"approve_{device_id}"})
+
+                    kb = [toggle_btn] if toggle_btn else []
+                    kb.append([{"text": "🔙 К списку", "callback_data": "menu_devices"}])
+
+                    edit(
+                        f"*💻 Устройство*\n\n"
+                        f"ID: `{pid}...`\n"
+                        f"Пользователь: {uname}\n"
+                        f"Статус: {status}\n"
+                        f"Платформа: {plat}\n"
+                        f"Версия: {ver}\n"
+                        f"Создан: {dev['created_at'].isoformat()[:10] if dev['created_at'] else '-'}",
+                        reply_markup={"inline_keyboard": kb},
                     )
-                    cur.execute(
-                        "UPDATE devices SET user_id = (SELECT id FROM users WHERE telegram_id = %s) WHERE request_id = %s",
-                        (TELEGRAM_ADMIN_ID, request_id),
+                    answer("")
+
+                elif data.startswith("toggle_") or data.startswith("block_") or data.startswith("approve_"):
+                    parts = data.split("_", 1)
+                    action = parts[0]
+                    device_id = parts[1]
+                    try:
+                        conn = get_db()
+                        cur = conn.cursor()
+                        if action == "toggle":
+                            cur.execute("UPDATE devices SET approved = TRUE, denied = FALSE WHERE device_id = %s", (device_id,))
+                            answer_text = "✅ Доступ возвращён"
+                        elif action == "block":
+                            cur.execute("UPDATE devices SET denied = TRUE, approved = FALSE WHERE device_id = %s", (device_id,))
+                            answer_text = "🔒 Устройство заблокировано"
+                        else:
+                            cur.execute("UPDATE devices SET approved = TRUE, denied = FALSE WHERE device_id = %s", (device_id,))
+                            answer_text = "✅ Устройство одобрено"
+                        conn.commit()
+                        cur.close()
+                        conn.close()
+                    except Exception as e:
+                        answer(f"Ошибка: {e}")
+                        continue
+
+                    answer(answer_text)
+                    # refresh device view
+                    edit(
+                        f"{answer_text}\n\nОбнови список устройств чтобы увидеть изменения.",
+                        reply_markup={"inline_keyboard": [[{"text": "🔄 Обновить", "callback_data": "menu_devices"}], [{"text": "🔙 Назад", "callback_data": "menu_back"}]]},
                     )
-                    answer_text = "✅ Устройство одобрено"
-                elif action == "deny":
-                    cur.execute(
-                        "UPDATE devices SET denied = TRUE, approved = FALSE, denied_at = NOW() WHERE request_id = %s",
-                        (request_id,),
-                    )
-                    answer_text = "❌ Устройство отклонено"
+
+                elif data.startswith("sub_"):
+                    uid = int(data.split("_")[1])
+                    try:
+                        conn = get_db()
+                        cur = conn.cursor(cursor_factory=RealDictCursor)
+                        cur.execute("SELECT * FROM subscriptions WHERE user_id = %s", (uid,))
+                        sub = cur.fetchone()
+                        cur.close()
+                        conn.close()
+                    except Exception as e:
+                        edit(f"Ошибка: {e}")
+                        answer("Ошибка")
+                        continue
+
+                    if sub:
+                        tier = sub["tier"]
+                        active = "✅" if sub["is_active"] else "❌"
+                        started = sub["started_at"].isoformat()[:10] if sub["started_at"] else "-"
+                        expires = sub["expires_at"].isoformat()[:10] if sub["expires_at"] else "бессрочно"
+                        edit(
+                            f"*👤 Пользователь #{uid}*\n\n"
+                            f"💳 Тариф: `{tier}`\n"
+                            f"Активна: {active}\n"
+                            f"📅 С: {started}\n"
+                            f"⏳ До: {expires}",
+                            reply_markup={
+                                "inline_keyboard": [
+                                    [{"text": "✏️ Pro 30 дней", "callback_data": f"dosettier_{uid}_pro"},
+                                     {"text": "✏️ Premium 30 дней", "callback_data": f"dosettier_{uid}_premium"}],
+                                    [{"text": "🆓 Сделать Free", "callback_data": f"dosettier_{uid}_free"}],
+                                    [{"text": "🔙 Назад", "callback_data": "menu_users"}],
+                                ]
+                            },
+                        )
+                    else:
+                        edit(
+                            f"*👤 Пользователь #{uid}*\n\n💳 Тариф: `free`\nНет подписки.",
+                            reply_markup={
+                                "inline_keyboard": [
+                                    [{"text": "✏️ Pro 30 дней", "callback_data": f"dosettier_{uid}_pro"},
+                                     {"text": "✏️ Premium 30 дней", "callback_data": f"dosettier_{uid}_premium"}],
+                                    [{"text": "🔙 Назад", "callback_data": "menu_users"}],
+                                ]
+                            },
+                        )
+                    answer("")
+
+                elif data.startswith("dosettier_"):
+                    parts = data.split("_", 2)
+                    uid = int(parts[1])
+                    tier = parts[2]
+
+                    try:
+                        conn = get_db()
+                        cur = conn.cursor()
+                        if tier == "free":
+                            cur.execute(
+                                """INSERT INTO subscriptions (user_id, tier, expires_at, is_active)
+                                   VALUES (%s, 'free', NULL, TRUE)
+                                   ON CONFLICT (user_id) DO UPDATE SET tier = 'free', expires_at = NULL, is_active = TRUE""",
+                                (uid,),
+                            )
+                        else:
+                            cur.execute(
+                                """INSERT INTO subscriptions (user_id, tier, expires_at)
+                                   VALUES (%s, %s, NOW() + INTERVAL '30 days')
+                                   ON CONFLICT (user_id) DO UPDATE SET tier = EXCLUDED.tier, expires_at = EXCLUDED.expires_at, is_active = TRUE""",
+                                (uid, tier),
+                            )
+                        conn.commit()
+                        cur.close()
+                        conn.close()
+                        answer(f"✅ {tier} на 30 дней")
+                        edit(
+                            f"*👤 Пользователь #{uid}*\n\n✅ Тариф изменён на `{tier}` на 30 дней.",
+                            reply_markup={"inline_keyboard": [[{"text": "🔙 Назад", "callback_data": "menu_users"}]]},
+                        )
+                    except Exception as e:
+                        answer(f"Ошибка: {e}")
+
+                # ── approve / deny from activation requests ──
+                elif data.startswith("approve:") or data.startswith("deny:"):
+                    action, request_id = data.split(":", 1)
+                    try:
+                        conn = get_db()
+                        cur = conn.cursor(cursor_factory=RealDictCursor)
+                        cur.execute("SELECT * FROM devices WHERE request_id = %s", (request_id,))
+                        device = cur.fetchone()
+                        if not device:
+                            cur.close(); conn.close()
+                            answer("Устройство не найдено")
+                            continue
+
+                        if action == "approve":
+                            cur.execute("UPDATE devices SET approved = TRUE, denied = FALSE, approved_at = NOW() WHERE request_id = %s", (request_id,))
+                            device_id_val = device["device_id"]
+                            cur.execute(
+                                """INSERT INTO users (email) VALUES (%s)
+                                   ON CONFLICT (email) DO UPDATE SET updated_at = NOW()""",
+                                (device_id_val,),
+                            )
+                            cur.execute(
+                                "UPDATE devices SET user_id = (SELECT id FROM users WHERE email = %s) WHERE request_id = %s",
+                                (device_id_val, request_id),
+                            )
+                            answer_text = "✅ Устройство одобрено"
+                        else:
+                            cur.execute("UPDATE devices SET denied = TRUE, approved = FALSE, denied_at = NOW() WHERE request_id = %s", (request_id,))
+                            answer_text = "❌ Устройство отклонено"
+
+                        conn.commit()
+                        cur.close()
+                        conn.close()
+                        answer(answer_text)
+                        requests.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                            json={"chat_id": TELEGRAM_ADMIN_ID, "text": answer_text},
+                        )
+                    except Exception as e:
+                        print(f"Callback error: {e}")
+                        answer(f"Ошибка")
                 else:
-                    cur.close()
-                    conn.close()
-                    continue
-
-                conn.commit()
-                cur.close()
-                conn.close()
-
-                requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
-                    json={"callback_query_id": callback["id"], "text": answer_text},
-                )
-                requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                    json={"chat_id": TELEGRAM_ADMIN_ID, "text": answer_text},
-                )
+                    answer("Неизвестная команда")
 
         except Exception as e:
             print("Telegram polling error:", e)
@@ -437,7 +686,28 @@ def startup():
 
 @app.get("/")
 def home():
-    return {"status": "activation server works"}
+    return HTMLResponse("""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aivex Activation Server</title>
+    <style>
+        body { font-family: -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #0c0c0e; color: #fff; }
+        .card { text-align: center; padding: 2rem; }
+        h1 { font-size: 2rem; font-weight: 600; }
+        p { color: rgba(255,255,255,0.6); }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Aivex</h1>
+        <p>Activation server is running</p>
+    </div>
+</body>
+</html>
+""")
 
 
 @app.post("/request-access")
@@ -557,9 +827,6 @@ def chat(payload: ChatRequest):
     if not DATABASE_URL:
         raise HTTPException(status_code=503, detail="Database not configured")
 
-    if not chat_limiter.check(payload.device_id):
-        raise HTTPException(status_code=429, detail="Too many requests. Try again later.")
-
     conn = get_db()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute(
@@ -576,6 +843,9 @@ def chat(payload: ChatRequest):
         raise HTTPException(status_code=403, detail="Device access denied")
     if not device["approved"]:
         raise HTTPException(status_code=403, detail="Device not yet approved")
+
+    if not chat_limiter.check(payload.device_id):
+        raise HTTPException(status_code=429, detail="Too many requests. Try again later.")
 
     system_prompt = payload.custom_prompt or SYSTEM_PROMPTS.get(
         payload.profile, SYSTEM_PROMPTS["Tutor"],
@@ -653,7 +923,7 @@ def create_payment(payload: PaymentRequest):
     conn = get_db()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute(
-        "SELECT id, approved, denied FROM devices WHERE device_id = %s",
+        "SELECT id, user_id, approved, denied FROM devices WHERE device_id = %s",
         (payload.device_id,),
     )
     device = cur.fetchone()
@@ -668,9 +938,14 @@ def create_payment(payload: PaymentRequest):
         cur.close(); conn.close()
         raise HTTPException(status_code=403, detail="Device not approved")
 
+    user_id = device["user_id"]
+    if not user_id:
+        cur.close(); conn.close()
+        raise HTTPException(status_code=403, detail="Device not linked to user")
+
     cur.execute(
         "SELECT tier, is_active FROM subscriptions WHERE user_id = %s",
-        (device["id"],),
+        (user_id,),
     )
     sub = cur.fetchone()
     cur.close(); conn.close()
