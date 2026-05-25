@@ -52,6 +52,9 @@ class RateLimiter:
 
 chat_limiter = RateLimiter(default_limit=60)
 
+# ожидание ввода длительности подписки: {chat_id: {"uid": int, "tier": str}}
+_pending_duration = {}
+
 def verify_admin_token(authorization: str | None = Header(None)):
     if not ADMIN_API_TOKEN:
         raise HTTPException(status_code=503, detail="Admin API not configured")
@@ -121,6 +124,49 @@ def init_db():
         cur.close()
         conn.close()
         print("Database initialized successfully")
+
+        # Migration: split shared users — each device gets its own user
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            """SELECT d.user_id, COUNT(*) as cnt
+               FROM devices d
+               WHERE d.user_id IS NOT NULL
+               GROUP BY d.user_id
+               HAVING COUNT(*) > 1"""
+        )
+        shared = cur.fetchall()
+        for row in shared:
+            old_user_id = row["user_id"]
+            cur.execute("SELECT * FROM devices WHERE user_id = %s ORDER BY id", (old_user_id,))
+            devices = cur.fetchall()
+            for i, dev in enumerate(devices):
+                if i == 0:
+                    continue  # keep first device on the original user
+                new_email = dev["device_id"]
+                cur.execute(
+                    """INSERT INTO users (email) VALUES (%s) ON CONFLICT DO NOTHING""",
+                    (new_email,),
+                )
+                cur.execute("SELECT id FROM users WHERE email = %s", (new_email,))
+                new_user = cur.fetchone()
+                if new_user:
+                    cur.execute("UPDATE devices SET user_id = %s WHERE id = %s", (new_user["id"], dev["id"]))
+                    # copy subscription if exists
+                    cur.execute("SELECT * FROM subscriptions WHERE user_id = %s", (old_user_id,))
+                    old_sub = cur.fetchone()
+                    if old_sub:
+                        cur.execute(
+                            """INSERT INTO subscriptions (user_id, tier, expires_at, is_active)
+                               VALUES (%s, %s, %s, %s)
+                               ON CONFLICT (user_id) DO NOTHING""",
+                            (new_user["id"], old_sub["tier"], old_sub["expires_at"], old_sub["is_active"]),
+                        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        if shared:
+            print(f"Migration: split {len(shared)} shared user(s) into individual device users")
     except Exception as e:
         print(f"ERROR: init_db failed: {e}")
 
@@ -199,6 +245,33 @@ def telegram_polling():
                             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                             json={"chat_id": chat_id, "text": "⛔ У вас нет прав."},
                         )
+                        continue
+
+                    # ── handle pending duration input ──
+                    if chat_id in _pending_duration:
+                        if text.startswith("/"):
+                            _pending_duration.pop(chat_id)
+                            send("⏸ Ввод срока отменён.")
+                            continue
+                        pending = _pending_duration.pop(chat_id)
+                        uid = pending["uid"]
+                        tier = pending["tier"]
+                        interval_str = text.strip("\"'")
+                        try:
+                            conn = get_db()
+                            cur = conn.cursor()
+                            cur.execute(
+                                """INSERT INTO subscriptions (user_id, tier, expires_at)
+                                   VALUES (%s, %s, NOW() + %s::interval)
+                                   ON CONFLICT (user_id) DO UPDATE SET tier = EXCLUDED.tier, expires_at = EXCLUDED.expires_at, is_active = TRUE""",
+                                (uid, tier, interval_str),
+                            )
+                            conn.commit()
+                            cur.close()
+                            conn.close()
+                            send(f"✅ Пользователь #{uid} → *{tier}* на `{interval_str}`")
+                        except Exception as e:
+                            send(f"Ошибка: {e}")
                         continue
 
                     def send(text, **kw):
@@ -356,7 +429,7 @@ def telegram_polling():
                     )
 
                 def edit(text, **kw):
-                    requests.post(
+                    resp = requests.post(
                         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
                         json={
                             "chat_id": chat_id,
@@ -366,6 +439,8 @@ def telegram_polling():
                             **kw,
                         },
                     )
+                    if not resp.ok:
+                        print(f"editMessageText failed: {resp.status_code} {resp.text[:200]}")
 
                 def menu_keyboard():
                     return {
@@ -456,17 +531,17 @@ def telegram_polling():
                             pid = r["device_id"][:8] if r["device_id"] else "???"
                             uname = r["username"] or "-"
                             label = f"{status} {pid}... | {uname}"
-                            kb.append([{"text": label, "callback_data": f"device_{r['device_id']}"}])
+                            kb.append([{"text": label, "callback_data": f"dvc_{r['id']}"}])
                         kb.append([{"text": "🔙 Назад", "callback_data": "menu_back"}])
                         edit("*💻 Устройства*\n\nНажми на устройство чтобы управлять 👇", reply_markup={"inline_keyboard": kb})
                     answer(f"{len(rows)} устройств")
 
-                elif data.startswith("device_"):
-                    device_id = data[len("device_"):]
+                elif data.startswith("dvc_"):
+                    device_db_id = int(data[len("dvc_"):])
                     try:
                         conn = get_db()
                         cur = conn.cursor(cursor_factory=RealDictCursor)
-                        cur.execute("SELECT * FROM devices WHERE device_id = %s", (device_id,))
+                        cur.execute("SELECT * FROM devices WHERE id = %s", (device_db_id,))
                         dev = cur.fetchone()
                         cur.close()
                         conn.close()
@@ -485,14 +560,15 @@ def telegram_polling():
                     uname = dev["username"] or "-"
                     plat = dev["platform"] or "-"
                     ver = dev["app_version"] or "-"
+                    dev_pid = dev["id"]
 
                     toggle_btn = []
                     if dev["approved"] or dev["denied"]:
-                        toggle_btn.append({"text": "🔓 Вернуть доступ", "callback_data": f"toggle_{device_id}"})
+                        toggle_btn.append({"text": "🔓 Вернуть доступ", "callback_data": f"tog_{dev_pid}"})
                     if dev["approved"]:
-                        toggle_btn.append({"text": "🔒 Заблокировать", "callback_data": f"block_{device_id}"})
+                        toggle_btn.append({"text": "🔒 Заблокировать", "callback_data": f"blk_{dev_pid}"})
                     if dev["denied"]:
-                        toggle_btn.append({"text": "✅ Одобрить", "callback_data": f"approve_{device_id}"})
+                        toggle_btn.append({"text": "✅ Одобрить", "callback_data": f"apr_{dev_pid}"})
 
                     kb = [toggle_btn] if toggle_btn else []
                     kb.append([{"text": "🔙 К списку", "callback_data": "menu_devices"}])
@@ -507,23 +583,23 @@ def telegram_polling():
                         f"Создан: {dev['created_at'].isoformat()[:10] if dev['created_at'] else '-'}",
                         reply_markup={"inline_keyboard": kb},
                     )
-                    answer("")
+                    answer(f"Устройство {pid}...")
 
-                elif data.startswith("toggle_") or data.startswith("block_") or data.startswith("approve_"):
+                elif data.startswith("tog_") or data.startswith("blk_") or data.startswith("apr_"):
                     parts = data.split("_", 1)
                     action = parts[0]
-                    device_id = parts[1]
+                    dev_pid = int(parts[1])
                     try:
                         conn = get_db()
                         cur = conn.cursor()
-                        if action == "toggle":
-                            cur.execute("UPDATE devices SET approved = TRUE, denied = FALSE WHERE device_id = %s", (device_id,))
+                        if action == "tog":
+                            cur.execute("UPDATE devices SET approved = TRUE, denied = FALSE WHERE id = %s", (dev_pid,))
                             answer_text = "✅ Доступ возвращён"
-                        elif action == "block":
-                            cur.execute("UPDATE devices SET denied = TRUE, approved = FALSE WHERE device_id = %s", (device_id,))
+                        elif action == "blk":
+                            cur.execute("UPDATE devices SET denied = TRUE, approved = FALSE WHERE id = %s", (dev_pid,))
                             answer_text = "🔒 Устройство заблокировано"
                         else:
-                            cur.execute("UPDATE devices SET approved = TRUE, denied = FALSE WHERE device_id = %s", (device_id,))
+                            cur.execute("UPDATE devices SET approved = TRUE, denied = FALSE WHERE id = %s", (dev_pid,))
                             answer_text = "✅ Устройство одобрено"
                         conn.commit()
                         cur.close()
@@ -546,6 +622,8 @@ def telegram_polling():
                         cur = conn.cursor(cursor_factory=RealDictCursor)
                         cur.execute("SELECT * FROM subscriptions WHERE user_id = %s", (uid,))
                         sub = cur.fetchone()
+                        cur.execute("SELECT * FROM devices WHERE user_id = %s ORDER BY created_at DESC", (uid,))
+                        devices = cur.fetchall()
                         cur.close()
                         conn.close()
                     except Exception as e:
@@ -553,43 +631,80 @@ def telegram_polling():
                         answer("Ошибка")
                         continue
 
-                    if sub:
-                        tier = sub["tier"]
-                        active = "✅" if sub["is_active"] else "❌"
-                        started = sub["started_at"].isoformat()[:10] if sub["started_at"] else "-"
-                        expires = sub["expires_at"].isoformat()[:10] if sub["expires_at"] else "бессрочно"
-                        edit(
-                            f"*👤 Пользователь #{uid}*\n\n"
-                            f"💳 Тариф: `{tier}`\n"
-                            f"Активна: {active}\n"
-                            f"📅 С: {started}\n"
-                            f"⏳ До: {expires}",
-                            reply_markup={
-                                "inline_keyboard": [
-                                    [{"text": "✏️ Pro 30 дней", "callback_data": f"dosettier_{uid}_pro"},
-                                     {"text": "✏️ Premium 30 дней", "callback_data": f"dosettier_{uid}_premium"}],
-                                    [{"text": "🆓 Сделать Free", "callback_data": f"dosettier_{uid}_free"}],
-                                    [{"text": "🔙 Назад", "callback_data": "menu_users"}],
-                                ]
-                            },
-                        )
-                    else:
-                        edit(
-                            f"*👤 Пользователь #{uid}*\n\n💳 Тариф: `free`\nНет подписки.",
-                            reply_markup={
-                                "inline_keyboard": [
-                                    [{"text": "✏️ Pro 30 дней", "callback_data": f"dosettier_{uid}_pro"},
-                                     {"text": "✏️ Premium 30 дней", "callback_data": f"dosettier_{uid}_premium"}],
-                                    [{"text": "🔙 Назад", "callback_data": "menu_users"}],
-                                ]
-                            },
-                        )
-                    answer("")
+                    tier = sub["tier"] if sub else "free"
+                    active = "✅" if sub and sub["is_active"] else "❌"
+                    started = sub["started_at"].isoformat()[:10] if sub and sub["started_at"] else "-"
+                    expires = sub["expires_at"].isoformat()[:10] if sub and sub["expires_at"] else "бессрочно"
 
-                elif data.startswith("dosettier_"):
+                    device_lines = []
+                    device_btns = []
+                    for d in devices:
+                        s = "✅" if d["approved"] else ("❌" if d["denied"] else "⏳")
+                        pid = d["device_id"][:8] if d["device_id"] else "???"
+                        uname = d["username"] or "-"
+                        device_lines.append(f"{s} `{pid}...` | {uname}")
+                        device_btns.append([{"text": f"{'✅' if d['approved'] else '❌'} {uname}", "callback_data": f"dvc_{d['id']}"}])
+
+                    text = (
+                        f"*👤 Пользователь #{uid}*\n\n"
+                        f"💳 Тариф: `{tier}`\n"
+                        f"Активна: {active}\n"
+                        f"📅 С: {started}\n"
+                        f"⏳ До: {expires}"
+                    )
+                    if device_lines:
+                        text += f"\n\n*💻 Устройства:*\n" + "\n".join(device_lines)
+
+                    kb = device_btns + [
+                        [{"text": "💎 Pro", "callback_data": f"tier_{uid}_pro"},
+                         {"text": "👑 Premium", "callback_data": f"tier_{uid}_premium"}],
+                        [{"text": "🆓 Сделать Free", "callback_data": f"dosettier_{uid}_free"}],
+                        [{"text": "🔙 Назад", "callback_data": "menu_users"}],
+                    ]
+
+                    edit(text, reply_markup={"inline_keyboard": kb})
+                    answer(f"Пользователь #{uid}")
+
+                elif data.startswith("tier_"):
                     parts = data.split("_", 2)
                     uid = int(parts[1])
                     tier = parts[2]
+                    tier_name = "Pro" if tier == "pro" else "Premium"
+                    _pending_duration.pop(chat_id, None)
+                    edit(
+                        f"*👤 Пользователь #{uid}*\n\nВыбери срок для *{tier_name}*:",
+                        reply_markup={
+                            "inline_keyboard": [
+                                [{"text": "1 день", "callback_data": f"dosettier_{uid}_{tier}_1 day"},
+                                 {"text": "7 дней", "callback_data": f"dosettier_{uid}_{tier}_7 days"}],
+                                [{"text": "30 дней", "callback_data": f"dosettier_{uid}_{tier}_30 days"},
+                                 {"text": "90 дней", "callback_data": f"dosettier_{uid}_{tier}_90 days"}],
+                                [{"text": "✏️ Свой срок", "callback_data": f"customdur_{uid}_{tier}"}],
+                                [{"text": "🔙 Назад", "callback_data": f"sub_{uid}"}],
+                            ]
+                        },
+                    )
+                    answer("")
+
+                elif data.startswith("customdur_"):
+                    parts = data.split("_", 2)
+                    uid = int(parts[1])
+                    tier = parts[2]
+                    _pending_duration[chat_id] = {"uid": uid, "tier": tier}
+                    edit(
+                        f"*👤 Пользователь #{uid}*\n\nНапиши срок в чат.\n\n"
+                        f"Примеры:\n`30 days`\n`7 days`\n`1 hour`\n`90 days`\n`6 months`",
+                        reply_markup={"inline_keyboard": [[{"text": "🔙 Отмена", "callback_data": f"sub_{uid}"}]]},
+                    )
+                    answer("✏️ Введи срок")
+
+                elif data.startswith("dosettier_"):
+                    parts = data.split("_", 3)
+                    if len(parts) < 4:
+                        continue
+                    uid = int(parts[1])
+                    tier = parts[2]
+                    interval_str = parts[3]
 
                     try:
                         conn = get_db()
@@ -601,21 +716,29 @@ def telegram_polling():
                                    ON CONFLICT (user_id) DO UPDATE SET tier = 'free', expires_at = NULL, is_active = TRUE""",
                                 (uid,),
                             )
+                            conn.commit()
+                            cur.close()
+                            conn.close()
+                            answer(f"✅ Free")
+                            edit(
+                                f"*👤 Пользователь #{uid}*\n\n✅ Тариф изменён на Free.",
+                                reply_markup={"inline_keyboard": [[{"text": "🔙 Назад", "callback_data": "menu_users"}]]},
+                            )
                         else:
                             cur.execute(
                                 """INSERT INTO subscriptions (user_id, tier, expires_at)
-                                   VALUES (%s, %s, NOW() + INTERVAL '30 days')
+                                   VALUES (%s, %s, NOW() + %s::interval)
                                    ON CONFLICT (user_id) DO UPDATE SET tier = EXCLUDED.tier, expires_at = EXCLUDED.expires_at, is_active = TRUE""",
-                                (uid, tier),
+                                (uid, tier, interval_str),
                             )
-                        conn.commit()
-                        cur.close()
-                        conn.close()
-                        answer(f"✅ {tier} на 30 дней")
-                        edit(
-                            f"*👤 Пользователь #{uid}*\n\n✅ Тариф изменён на `{tier}` на 30 дней.",
-                            reply_markup={"inline_keyboard": [[{"text": "🔙 Назад", "callback_data": "menu_users"}]]},
-                        )
+                            conn.commit()
+                            cur.close()
+                            conn.close()
+                            answer(f"✅ {tier} на {interval_str}")
+                            edit(
+                                f"*👤 Пользователь #{uid}*\n\n✅ Тариф изменён на `{tier}` на `{interval_str}`.",
+                                reply_markup={"inline_keyboard": [[{"text": "🔙 Назад", "callback_data": "menu_users"}]]},
+                            )
                     except Exception as e:
                         answer(f"Ошибка: {e}")
 
