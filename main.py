@@ -247,6 +247,21 @@ def telegram_polling():
                         )
                         continue
 
+                    def send(text, **kw):
+                        requests.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown", **kw},
+                        )
+
+                    def menu_keyboard():
+                        return {
+                            "inline_keyboard": [
+                                [{"text": "👥 Пользователи", "callback_data": "menu_users"},
+                                 {"text": "💻 Устройства", "callback_data": "menu_devices"}],
+                                [{"text": "❓ Помощь", "callback_data": "menu_help"}],
+                            ]
+                        }
+
                     # ── handle pending duration input ──
                     if chat_id in _pending_duration:
                         if text.startswith("/"):
@@ -274,21 +289,6 @@ def telegram_polling():
                             send(f"Ошибка: {e}")
                         continue
 
-                    def send(text, **kw):
-                        requests.post(
-                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown", **kw},
-                        )
-
-                    def menu_keyboard():
-                        return {
-                            "inline_keyboard": [
-                                [{"text": "👥 Пользователи", "callback_data": "menu_users"},
-                                 {"text": "💻 Устройства", "callback_data": "menu_devices"}],
-                                [{"text": "❓ Помощь", "callback_data": "menu_help"}],
-                            ]
-                        }
-
                     if text in ("/start", "/help", "/menu"):
                         send(
                             "*Aivex Bot*\n\n"
@@ -303,12 +303,22 @@ def telegram_polling():
                         send(f"Ошибка БД: {e}")
                         continue
 
-                    if text == "/users":
+                    if text == "/resetall":
+                        cur = conn.cursor()
+                        cur.execute("DELETE FROM subscriptions")
+                        cur.execute("DELETE FROM devices")
+                        cur.execute("DELETE FROM users")
+                        conn.commit()
+                        cur.close()
+                        send("✅ Все данные удалены.")
+                        continue
+                    elif text == "/users":
                         cur = conn.cursor(cursor_factory=RealDictCursor)
                         cur.execute(
                             """SELECT u.*,
                                       (SELECT COUNT(*) FROM devices d WHERE d.user_id = u.id AND d.approved) AS devices_count,
                                       (SELECT d.username FROM devices d WHERE d.user_id = u.id ORDER BY d.created_at DESC LIMIT 1) AS device_username,
+                                      (SELECT d.device_id FROM devices d WHERE d.user_id = u.id ORDER BY d.created_at DESC LIMIT 1) AS device_id,
                                       s.tier
                                FROM users u
                                LEFT JOIN subscriptions s ON s.user_id = u.id
@@ -325,10 +335,11 @@ def telegram_polling():
                             for i, r in enumerate(rows, 1):
                                 email = r["email"] or "-"
                                 username = r["device_username"] or "-"
+                                did = (r["device_id"] or "")[:8]
                                 tier = r["tier"] or "free"
                                 devices = r["devices_count"] or 0
                                 lines.append(
-                                    f"{i}. #{r['id']} | {username}\n"
+                                    f"{i}. #{r['id']} | {username} | `{did}...`\n"
                                     f"   📱 {devices} | 💳 {tier}"
                                 )
                             send(
@@ -462,7 +473,8 @@ def telegram_polling():
                         "`/users` — список пользователей\n"
                         "`/devices` — список устройств\n"
                         "`/sub <id>` — информация о подписке\n"
-                        "`/settier <id> <tier> [срок]` — назначить тариф\n\n"
+                        "`/settier <id> <tier> [срок]` — назначить тариф\n"
+                        "`/resetall` — удалить все данные\n\n"
                         "Пример: `/settier 5 premium \"30 days\"`\n"
                         "Срок: `\"1 hour\"`, `\"7 days\"`, `\"90 days\"`",
                         reply_markup={"inline_keyboard": [[{"text": "🔙 Назад", "callback_data": "menu_back"}]]},
@@ -477,6 +489,7 @@ def telegram_polling():
                             """SELECT u.*,
                                       (SELECT COUNT(*) FROM devices d WHERE d.user_id = u.id AND d.approved) AS devices_count,
                                       (SELECT d.username FROM devices d WHERE d.user_id = u.id ORDER BY d.created_at DESC LIMIT 1) AS device_username,
+                                      (SELECT d.device_id FROM devices d WHERE d.user_id = u.id ORDER BY d.created_at DESC LIMIT 1) AS device_id,
                                       s.tier
                                FROM users u
                                LEFT JOIN subscriptions s ON s.user_id = u.id
@@ -497,7 +510,8 @@ def telegram_polling():
                         for i, r in enumerate(rows[:10], 1):
                             tier = r["tier"] or "free"
                             username = r["device_username"] or "-"
-                            kb.append([{"text": f"{i}. #{r['id']} | {username} | {tier}", "callback_data": f"sub_{r['id']}"}])
+                            did = (r["device_id"] or "")[:8]
+                            kb.append([{"text": f"{i}. #{r['id']} | {username} | {did}... | {tier}", "callback_data": f"sub_{r['id']}"}])
                         kb.append([{"text": "🔙 Назад", "callback_data": "menu_back"}])
                         edit("*👥 Пользователи*\n\nНажми на пользователя чтобы управлять 👇", reply_markup={"inline_keyboard": kb})
                     answer(f"{len(rows)} пользователей")
@@ -699,12 +713,18 @@ def telegram_polling():
                     answer("✏️ Введи срок")
 
                 elif data.startswith("dosettier_"):
-                    parts = data.split("_", 3)
-                    if len(parts) < 4:
+                    parts = data.split("_", 2)
+                    if len(parts) < 3:
                         continue
                     uid = int(parts[1])
-                    tier = parts[2]
-                    interval_str = parts[3]
+                    rest = parts[2]
+                    if rest == "free":
+                        tier = "free"
+                        interval_str = None
+                    else:
+                        sub = rest.split("_", 1)
+                        tier = sub[0]
+                        interval_str = sub[1] if len(sub) > 1 else "30 days"
 
                     try:
                         conn = get_db()
@@ -849,19 +869,22 @@ def request_access(data: ActivationRequest):
 
     request_id = uuid.uuid4().hex[:12]
     cur.execute(
-        """INSERT INTO devices (device_id, request_id, platform, app_version, username)
-           VALUES (%s, %s, %s, %s, %s)""",
+        """INSERT INTO devices (device_id, request_id, platform, app_version, username, approved)
+           VALUES (%s, %s, %s, %s, %s, TRUE)""",
         (data.deviceId, request_id, data.platform, data.appVersion, data.username),
     )
+    cur.execute(
+        """INSERT INTO users (email) VALUES (%s) ON CONFLICT DO NOTHING""",
+        (data.deviceId,),
+    )
+    cur.execute("SELECT id FROM users WHERE email = %s", (data.deviceId,))
+    user = cur.fetchone()
+    if user:
+        cur.execute("UPDATE devices SET user_id = %s WHERE device_id = %s", (user["id"], data.deviceId))
     conn.commit()
-
-    cur.execute("SELECT * FROM devices WHERE device_id = %s", (data.deviceId,))
-    device = cur.fetchone()
     cur.close()
     conn.close()
-
-    send_telegram_activation_request(device)
-    return {"ok": True, "status": "pending"}
+    return {"ok": True, "status": "approved"}
 
 
 @app.post("/check-access")
@@ -873,6 +896,11 @@ def check_access(data: ActivationRequest):
     device = cur.fetchone()
     cur.close()
     conn.close()
+
+    if not device:
+        return {"allowed": False, "status": "not_requested"}
+
+    return {"allowed": True, "status": "approved"}
 
     if not device:
         return {"allowed": False, "status": "not_requested"}
