@@ -231,7 +231,6 @@ def telegram_polling():
             for update in data.get("result", []):
                 offset = update["update_id"] + 1
 
-                # ── handle text commands ──
                 msg = update.get("message")
                 if msg and msg.get("text"):
                     chat_id = msg["chat"]["id"]
@@ -262,7 +261,6 @@ def telegram_polling():
                             ]
                         }
 
-                    # ── handle pending duration input ──
                     if chat_id in _pending_duration:
                         if text.startswith("/"):
                             _pending_duration.pop(chat_id)
@@ -424,7 +422,6 @@ def telegram_polling():
 
                     continue
 
-                # ── handle callback queries ──
                 callback = update.get("callback_query")
                 if not callback:
                     continue
@@ -462,7 +459,6 @@ def telegram_polling():
                         ]
                     }
 
-                # ── menu navigation ──
                 if data == "menu_back":
                     edit("*Aivex Bot*\n\nУправляй подписками и устройствами 👇", reply_markup=menu_keyboard())
                     answer("Меню")
@@ -762,7 +758,6 @@ def telegram_polling():
                     except Exception as e:
                         answer(f"Ошибка: {e}")
 
-                # ── approve / deny from activation requests ──
                 elif data.startswith("approve:") or data.startswith("deny:"):
                     action, request_id = data.split(":", 1)
                     try:
@@ -809,9 +804,6 @@ def telegram_polling():
         except Exception as e:
             print("Telegram polling error:", e)
             time.sleep(3)
-
-
-# ─── API ───────────────────────────────────────────────────────────────
 
 
 @app.on_event("startup")
@@ -944,9 +936,6 @@ def deny_device(device_id: str, _auth=Depends(verify_admin_token)):
     return {"ok": True, "status": "denied"}
 
 
-# ─── CHAT API ──────────────────────────────────────────────────────────
-
-
 class HistoryMessage(BaseModel):
     role: str
     content: str
@@ -1041,9 +1030,6 @@ def chat(payload: ChatRequest):
         return {"response": completion.choices[0].message.content}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"OpenRouter error: {str(e)}")
-
-
-# ─── YOOKASSA PAYMENT ──────────────────────────────────────────────────
 
 
 TIER_PRICES = {
@@ -1188,9 +1174,6 @@ async def payment_webhook(request: Request):
         cur.close(); conn.close()
 
     return {"ok": True}
-
-
-# ─── SUBSCRIPTION API ──────────────────────────────────────────────────
 
 
 class SubscriptionCreate(BaseModel):
